@@ -1,0 +1,228 @@
+services:
+
+  ###
+  ### Supabase stack
+  ###
+
+  db:
+    image: supabase/postgres:15.8.1.085
+    # supabase/postgres bundles pgRouting and all other Supabase extensions
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf -c log_min_messages=fatal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -h localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_HOST: /var/run/postgresql
+      PGPORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      POSTGRES_USER: postgres
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXP: ${JWT_EXPIRY:-3600}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      # Supabase init scripts (order matters — numbered by supabase/postgres image convention)
+      - ./volumes/db/_supabase.sql:/docker-entrypoint-initdb.d/migrations/97-_supabase.sql:ro
+      - ./volumes/db/webhooks.sql:/docker-entrypoint-initdb.d/init-scripts/98-webhooks.sql:ro
+      - ./volumes/db/roles.sql:/docker-entrypoint-initdb.d/init-scripts/99-roles.sql:ro
+      - ./volumes/db/jwt.sql:/docker-entrypoint-initdb.d/init-scripts/99-jwt.sql:ro
+      # WCS warehouse graph (pgRouting must be enabled first)
+      - ./volumes/db/init/00-extensions.sql:/docker-entrypoint-initdb.d/init-scripts/00-extensions.sql:ro
+      # - ./vrp_server/db/graph/merged.sql:/docker-entrypoint-initdb.d/migrations/98-graph.sql:ro
+    restart: unless-stopped
+
+  rest:
+    image: postgrest/postgrest:v14.5
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-db}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-postgres}
+      PGRST_DB_SCHEMAS: ${PGRST_DB_SCHEMAS:-public,graphql_public}
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+      PGRST_APP_SETTINGS_JWT_SECRET: ${JWT_SECRET}
+      PGRST_APP_SETTINGS_JWT_EXP: ${JWT_EXPIRY:-3600}
+    command: postgrest
+    restart: unless-stopped
+
+  meta:
+    image: supabase/postgres-meta:v0.95.2
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PG_META_PORT: 8080
+      PG_META_DB_HOST: ${POSTGRES_HOST:-db}
+      PG_META_DB_PORT: ${POSTGRES_PORT:-5432}
+      PG_META_DB_NAME: ${POSTGRES_DB:-postgres}
+      PG_META_DB_USER: supabase_admin
+      PG_META_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      CRYPTO_KEY: ${PG_META_CRYPTO_KEY}
+    restart: unless-stopped
+
+  storage:
+    image: supabase/storage-api:v1.37.8
+    depends_on:
+      db:
+        condition: service_healthy
+      rest:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://storage:5000/status"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    environment:
+      ANON_KEY: ${ANON_KEY}
+      SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      POSTGREST_URL: http://rest:3000
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      DATABASE_URL: postgres://supabase_storage_admin:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-db}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-postgres}
+      REQUEST_ALLOW_X_FORWARDED_PATH: "true"
+      FILE_SIZE_LIMIT: ${STORAGE_FILE_SIZE_LIMIT:-52428800}
+      STORAGE_BACKEND: file
+      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
+      TENANT_ID: ${STORAGE_TENANT_ID:-stub}
+      REGION: ${REGION:-stub}
+      GLOBAL_S3_BUCKET: ${GLOBAL_S3_BUCKET:-stub}
+      ENABLE_IMAGE_TRANSFORMATION: "false"
+      S3_PROTOCOL_ACCESS_KEY_ID: ${S3_PROTOCOL_ACCESS_KEY_ID:-}
+      S3_PROTOCOL_ACCESS_KEY_SECRET: ${S3_PROTOCOL_ACCESS_KEY_SECRET:-}
+    volumes:
+      - ./volumes/storage:/var/lib/storage
+    restart: unless-stopped
+
+  studio:
+    image: supabase/studio:2026.02.16-sha-26c615c
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/api/platform/profile').then(r => { if (!r.ok) throw new Error(r.status); })"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "${STUDIO_PORT:-54323}:3000"
+    environment:
+      HOSTNAME: "::"
+      STUDIO_PG_META_URL: http://meta:8080
+      POSTGRES_HOST: ${POSTGRES_HOST:-db}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PG_META_CRYPTO_KEY: ${PG_META_CRYPTO_KEY}
+      DEFAULT_ORGANIZATION_NAME: ${STUDIO_DEFAULT_ORGANIZATION:-WCS}
+      DEFAULT_PROJECT_NAME: ${STUDIO_DEFAULT_PROJECT:-Warehouse Control System}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      SUPABASE_URL: http://kong:8000
+      SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:8000}
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      AUTH_JWT_SECRET: ${JWT_SECRET}
+    volumes:
+      - ./volumes/snippets:/app/snippets
+      - ./volumes/functions:/app/edge-functions
+    restart: unless-stopped
+
+  kong:
+    image: kong:2.8.1
+    depends_on:
+      db:
+        condition: service_healthy
+    # Uses bash to expand shell env vars in the kong.yml template before Kong reads it
+    command: bash -c 'eval "echo \"$$(cat ~/temp.yml)\"" > ~/kong.yml && /docker-entrypoint.sh kong docker-start'
+    ports:
+      - "${KONG_HTTP_PORT:-8000}:8000"
+      - "${KONG_HTTPS_PORT:-8443}:8443"
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /home/kong/kong.yml
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth,request-termination,ip-restriction
+      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
+      KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:-supabase}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-supabase}
+    volumes:
+      # Mounted as temp.yml — the command above expands env vars into ~/kong.yml
+      - ./volumes/api/kong.yml:/home/kong/temp.yml:ro
+    restart: unless-stopped
+
+  ###
+  ### Infrastructure
+  ###
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  ###
+  ### Application services
+  ###
+
+  vrp_server:
+    build:
+      context: ./vrp_server
+      dockerfile: Dockerfile
+    ports:
+      - "18080:18080"
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-db}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-postgres}
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:18080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  fleet_gateway:
+    build:
+      context: ./fleet_gateway
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8000"
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      SUPABASE_URL: http://kong:8000
+      SUPABASE_KEY: ${ANON_KEY}
+      GRAPH_ID: ${GRAPH_ID:-1}
+      ROBOTS_CONFIG: ${ROBOTS_CONFIG:-{}}
+      VRP_SERVER_URL: http://vrp_server:18080
+    depends_on:
+      redis:
+        condition: service_healthy
+      vrp_server:
+        condition: service_healthy
+      kong:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  db_data:
+  redis_data:

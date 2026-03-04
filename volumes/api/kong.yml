@@ -1,0 +1,110 @@
+_format_version: "2.1"
+_transform: true
+
+###
+### Consumers / API keys
+###
+consumers:
+  - username: DASHBOARD
+    basicauth_credentials:
+      - username: ${DASHBOARD_USERNAME}
+        password: ${DASHBOARD_PASSWORD}
+  - username: anon
+    keyauth_credentials:
+      - key: ${SUPABASE_ANON_KEY}
+  - username: service_role
+    keyauth_credentials:
+      - key: ${SUPABASE_SERVICE_KEY}
+
+acls:
+  - consumer: anon
+    group: anon
+  - consumer: service_role
+    group: admin
+
+###
+### API proxy routes
+###
+services:
+
+  ## REST API (PostgREST)
+  - name: rest-v1
+    url: http://rest:3000/
+    routes:
+      - name: rest-v1-all
+        strip_path: true
+        paths:
+          - /rest/v1/
+    plugins:
+      - name: cors
+      - name: key-auth
+        config:
+          hide_credentials: true
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin
+            - anon
+
+  ## GraphQL (via PostgREST)
+  - name: graphql-v1
+    url: http://rest:3000/rpc/graphql
+    routes:
+      - name: graphql-v1-all
+        strip_path: true
+        paths:
+          - /graphql/v1
+    plugins:
+      - name: cors
+      - name: key-auth
+        config:
+          hide_credentials: true
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin
+            - anon
+
+  ## Postgres Meta (admin only — used by Studio)
+  - name: meta
+    url: http://meta:8080/
+    routes:
+      - name: meta-all
+        strip_path: true
+        paths:
+          - /pg/
+    plugins:
+      - name: key-auth
+        config:
+          hide_credentials: false
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin
+
+  ## Storage (manages its own JWT validation internally)
+  - name: storage-v1
+    url: http://storage:5000/
+    routes:
+      - name: storage-v1-all
+        strip_path: true
+        paths:
+          - /storage/v1/
+    plugins:
+      - name: cors
+
+  ## Studio dashboard (catch-all, protected by basic auth)
+  - name: dashboard
+    url: http://studio:3000/
+    routes:
+      - name: dashboard-all
+        strip_path: true
+        paths:
+          - /
+    plugins:
+      - name: basic-auth
+        config:
+          hide_credentials: true
