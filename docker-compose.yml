@@ -219,6 +219,19 @@ services:
         condition: service_started
     restart: unless-stopped
 
+  # Uncomment robot simulator for real-world application
+  robot_simulator:
+    image: journeykmutt/robot_simulator:latest
+    ports:
+      - "9090:9090"
+    command: >
+      ros2 launch robot_sim sim.launch.py
+      publish_rate:=10.0
+      radius:=5.0
+      speed:=0.5
+      port:=9090
+
+
 volumes:
   db_data:
   redis_data:
