@@ -2,7 +2,7 @@ BEGIN;
 
 
 -- ============================================================================
--- types.sql
+-- graph/types.sql
 -- ============================================================================
 
 
@@ -18,7 +18,7 @@ END $$;
 
 
 -- ============================================================================
--- tables.sql
+-- graph/tables.sql
 -- ============================================================================
 
 
@@ -129,7 +129,7 @@ CREATE TABLE IF NOT EXISTS public.wh_edges (
 
 
 -- ============================================================================
--- indexes.sql
+-- graph/indexes.sql
 -- ============================================================================
 
 
@@ -158,7 +158,7 @@ ON public.wh_nodes (graph_id);
 
 
 -- ============================================================================
--- triggers.sql
+-- graph/triggers.sql
 -- ============================================================================
 
 
@@ -301,7 +301,7 @@ FOR EACH ROW EXECUTE FUNCTION public.wh_cell_nodes_validate_graph();
 
 
 -- ============================================================================
--- views.sql
+-- graph/views.sql
 -- ============================================================================
 
 
@@ -468,7 +468,7 @@ CREATE OR REPLACE VIEW public.wh_graph_summary_view AS
 
 
 -- ============================================================================
--- functions.sql
+-- graph/functions.sql
 -- ============================================================================
 
 
@@ -1152,6 +1152,58 @@ AS $$
   FROM public.wh_nodes_view
   WHERE graph_id = p_graph_id
     AND alias = p_alias;
+$$;
+
+-- Get nodes by array of aliases in specified order
+-- Returns id, alias, tag_id, type, x, y, height for each matching node
+-- Validates all aliases belong to specified graph; preserves input array order
+CREATE OR REPLACE FUNCTION public.wh_get_nodes_by_aliases(
+  p_graph_id bigint,
+  p_aliases  text[]
+)
+RETURNS TABLE(
+  id bigint,
+  alias text,
+  tag_id text,
+  type node_type,
+  x real,
+  y real,
+  height real
+)
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+  v_invalid_aliases text[];
+BEGIN
+  -- Validate that all aliases exist in the specified graph
+  SELECT array_agg(a)
+  INTO v_invalid_aliases
+  FROM unnest(p_aliases) AS a
+  WHERE NOT EXISTS (
+    SELECT 1 FROM public.wh_nodes_view
+    WHERE wh_nodes_view.graph_id = p_graph_id AND wh_nodes_view.alias = a
+  );
+
+  IF v_invalid_aliases IS NOT NULL AND array_length(v_invalid_aliases, 1) > 0 THEN
+    RAISE EXCEPTION 'Aliases % do not exist in graph %', v_invalid_aliases, p_graph_id;
+  END IF;
+
+  -- Return nodes in specified order
+  RETURN QUERY
+  SELECT
+    nv.id,
+    nv.alias,
+    nv.tag_id,
+    nv.type,
+    nv.x,
+    nv.y,
+    nv.height
+  FROM unnest(p_aliases) WITH ORDINALITY AS input(alias_val, ord)
+  JOIN public.wh_nodes_view nv
+    ON nv.alias = input.alias_val AND nv.graph_id = p_graph_id
+  ORDER BY input.ord;
+END;
 $$;
 
 -- Get node by tag_id
@@ -2346,7 +2398,7 @@ $$;
 
 
 -- ============================================================================
--- permissions.sql
+-- graph/permissions.sql
 -- ============================================================================
 
 
