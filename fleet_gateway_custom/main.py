@@ -224,13 +224,14 @@ def _parse_robot_state(name: str, raw: Optional[str], heartbeat: Optional[str]) 
     except (json.JSONDecodeError, TypeError):
         return Robot(name=name, connection_status=conn_status,
                      last_action_status=RobotActionStatus("IDLE"))
-
-    # Override with Redis state's own connectionStatus if heartbeat exists
-    if heartbeat and data.get("connectionStatus") == "ONLINE":
-        conn_status = RobotConnectionStatus("ONLINE")
-    elif not heartbeat:
+    if heartbeat:
+        status_from_robot = data.get("connectionStatus", "OFFLINE")
+        try:
+            conn_status = RobotConnectionStatus(status_from_robot)
+        except ValueError:
+            conn_status = RobotConnectionStatus("OFFLINE")
+    else:
         conn_status = RobotConnectionStatus("OFFLINE")
-
     action_raw = data.get("lastActionStatus", "IDLE")
     try:
         action_status = RobotActionStatus(action_raw)
@@ -428,6 +429,47 @@ class Mutation:
             return JobOrderResult(
                 success=False,
                 message=f"Redis error dispatching travel to {order.robot_name}: {exc}",
+            )
+
+    @strawberry.mutation
+    async def send_robot_command(self, robot_name: str, command: str) -> JobOrderResult:
+        """Dispatch a control command (PAUSE/RESUME/ESTOP/CANCEL) via Redis pub/sub."""
+        normalized = command.upper().strip()
+        command_map = {
+            "PAUSE": "PAUSE",
+            "RESUME": "RESUME",
+            "ESTOP": "ESTOP",
+            "CANCEL": "CANCEL",
+            "CANCEL_ALL": "CANCEL",
+        }
+        if normalized not in command_map:
+            return JobOrderResult(
+                success=False,
+                message=(
+                    f"Unsupported command '{command}'. "
+                    "Allowed: PAUSE, RESUME, ESTOP, CANCEL"
+                ),
+            )
+
+        channel = f"robot:{robot_name}:command"
+        payload = json.dumps({
+            "op": "control",
+            "topic": "/travel_command",
+            "msg": {
+                "command": command_map[normalized],
+            },
+        })
+        try:
+            r = await get_redis()
+            await r.publish(channel, payload)
+            return JobOrderResult(
+                success=True,
+                message=f"{command_map[normalized]} dispatched to {robot_name}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return JobOrderResult(
+                success=False,
+                message=f"Redis error dispatching {normalized} to {robot_name}: {exc}",
             )
 
     @strawberry.mutation

@@ -48,6 +48,10 @@ export interface TravelOrderResult {
   success: boolean;
   message: string;
 }
+export interface RobotControlResult {
+  success: boolean;
+  message: string;
+}
 
 /** Aggregated result for a full vehicle-route dispatch. */
 export interface RouteDispatchResult {
@@ -147,6 +151,36 @@ export async function sendTravelOrder(
 
   return result;
 }
+export async function sendRobotControlCommand(
+  robotName: string,
+  command: 'PAUSE' | 'RESUME' | 'ESTOP' | 'CANCEL' | 'CANCEL_ALL',
+): Promise<RobotControlResult> {
+  const data = await gql<{ sendRobotCommand: RobotControlResult }>(
+    `mutation SendRobotCommand($robotName: String!, $command: String!) {
+       sendRobotCommand(robotName: $robotName, command: $command) { success message }
+     }`,
+    { robotName, command },
+  );
+  const result = data.sendRobotCommand;
+  if (!result.success) {
+    throw new Error(`sendRobotCommand rejected: ${result.message}`);
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Global State for Dispatch Control
+// ---------------------------------------------------------------------------
+
+/**
+ * Global AbortController to manage the cancellation of active dispatch loops.
+ * @type {AbortController}
+ */
+export let dispatchAbortController = new AbortController();
+export let isFleetPaused = false;
+export const setFleetPaused = (state: boolean): void => {
+  isFleetPaused = state;
+};
 
 /**
  * Dispatch all key waypoints of a VRP vehicle route to its assigned robot.
@@ -202,38 +236,70 @@ export async function dispatchVehicleRoute(
     `(${vrpWaypoints.length} waypoints)`,
   );
 
-  for (const nodeId of vrpWaypoints) {
-    const info = nodeInfo.get(nodeId);
+  // ดึงค่า signal ปัจจุบันมาใช้ในลูปนี้
+  const signal = dispatchAbortController.signal;
 
+  for (const nodeId of vrpWaypoints) {
+    if (signal.aborted) {
+      log.push(`[System] Dispatch cancelled by operator.`);
+      console.warn(`[Fleet] Dispatch for ${robotName} aborted.`);
+      break;
+    }
+    while (isFleetPaused) {
+      if (signal.aborted) {
+        log.push(`[System] Dispatch cancelled by operator.`);
+        console.warn(`[Fleet] Dispatch for ${robotName} aborted while paused.`);
+        break;
+      }
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 500);
+        signal.addEventListener(
+          'abort',
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          { once: true },
+        );
+      });
+    }
+    if (signal.aborted) {
+      log.push(`[System] Dispatch cancelled by operator.`);
+      console.warn(`[Fleet] Dispatch for ${robotName} aborted.`);
+      break;
+    }
+
+    const info = nodeInfo.get(nodeId);
     if (!info) {
-      // Node ID not found in the loaded map — skip silently
-      log.push(`⚠ Node ${nodeId}: not found in graph, skipped`);
       skipped++;
       continue;
     }
 
-    // Skip depot nodes — the robot returns to depot automatically after
-    // completing its last task; an explicit travel order is redundant.
     if (info.type === 'depot' || info.alias === '__depot__') {
-      log.push(`↩ ${info.alias} (depot): skipped`);
       skipped++;
       continue;
     }
 
     try {
       await sendTravelOrder(robotName, info.alias, info.x, info.y);
-      log.push(`✓ ${robotName} → ${info.alias} (${info.x.toFixed(2)}, ${info.y.toFixed(2)})`);
+      log.push(`✓ ${robotName} → ${info.alias}`);
       dispatched++;
 
-      // Small gap between commands so the Redis pub/sub channel and
-      // robot_bridge can process each message before the next arrives.
-      await new Promise(resolve => setTimeout(resolve, 200));
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 2000);
+        signal.addEventListener(
+          'abort',
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          { once: true },
+        );
+      });
 
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log.push(`✗ ${info.alias}: ${msg}`);
-      console.error(`[Fleet] Travel order failed for ${info.alias}:`, err);
-      // Continue dispatching remaining waypoints even if one fails
     }
   }
 
@@ -243,3 +309,20 @@ export async function dispatchVehicleRoute(
 
   return { robotName, dispatched, skipped, log };
 }
+
+/**
+ * Cancels all currently active vehicle dispatch sequences.
+ * This will immediately break the dispatch loops and prevent further waypoints
+ * from being sent to the robots.
+ */
+export const cancelAllDispatches = (): void => {
+  dispatchAbortController.abort();
+  // Reset the controller for future dispatches
+  dispatchAbortController = new AbortController();
+  isFleetPaused = false;
+  const activeRobots = Array.from(new Set(Object.values(VEHICLE_ROBOT_MAP)));
+  void Promise.allSettled(
+    activeRobots.map((robotName) => sendRobotControlCommand(robotName, 'ESTOP')),
+  );
+  console.log('[Fleet Gateway] All active dispatches have been cancelled by user and ESTOP sent.');
+};

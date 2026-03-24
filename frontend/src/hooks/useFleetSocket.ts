@@ -11,6 +11,7 @@
  */
 
 import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
+import { VEHICLE_ROBOT_MAP } from '../utils/fleetGateway';
 
 // ============================================
 // CONFIGURATION
@@ -19,7 +20,7 @@ import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 const FLEET_GW_URL = '/api/fleet/graphql';
 
 /** How often to poll fleet_gateway for robot state (ms) */
-const POLL_INTERVAL_MS = 1000;
+const POLL_INTERVAL_MS = 200;
 
 // ============================================
 // TYPE DEFINITIONS
@@ -46,6 +47,7 @@ export interface RobotCommand {
     command: 'GOTO' | 'PAUSE' | 'RESUME' | 'ESTOP';
     target_x?: number;
     target_y?: number;
+    robotName?: string;
     timestamp: number;
 }
 
@@ -69,10 +71,8 @@ const ROBOTS_QUERY = `
     robots {
       name
       connectionStatus
-      lastActionStatus
       mobileBaseState {
-        pose { x y a }
-        tag { qr_id }
+        pose { x y }
       }
     }
   }
@@ -81,10 +81,8 @@ const ROBOTS_QUERY = `
 interface GqlRobot {
     name: string;
     connectionStatus: 'ONLINE' | 'OFFLINE';
-    lastActionStatus: 'IDLE' | 'RUNNING' | 'ERROR';
     mobileBaseState?: {
-        pose?: { x: number; y: number; a: number } | null;
-        tag?: { qr_id: string } | null;
+        pose?: { x: number; y: number } | null;
     } | null;
 }
 
@@ -126,24 +124,21 @@ export const useFleetSocket = (): UseFleetSocketReturn => {
 
             gqlRobots.forEach((r) => {
                 const pose = r.mobileBaseState?.pose;
-                const actionStatus = r.lastActionStatus;
 
                 let status: RobotStatusMessage['status'] = 'offline';
                 if (r.connectionStatus === 'ONLINE') {
-                    status = actionStatus === 'RUNNING' ? 'busy' : 'idle';
+                    status = 'idle';
                 }
 
                 const entry: RobotStatusMessage = {
                     id: r.name,
                     status,
-                    battery: 100, // fleet_gateway doesn't expose battery — placeholder
+                    battery: 100,
                     x: pose?.x ?? 0,
                     y: pose?.y ?? 0,
-                    angle: pose?.a ?? 0,
+                    angle: 0,
                 };
 
-                // Index by both name and a numeric stub so FleetController's
-                // `robotStates[dbBot.id] || robotStates[dbBot.name]` lookup hits.
                 next[r.name] = entry;
             });
 
@@ -155,6 +150,7 @@ export const useFleetSocket = (): UseFleetSocketReturn => {
             }
         } catch (err) {
             if (!isMountedRef.current) return;
+            console.error('[FleetSocket] Poll Error:', err);
             if (connectionStatus === 'connected') {
                 console.warn('[FleetSocket] Poll failed:', err);
                 setConnectionStatus('reconnecting');
@@ -179,13 +175,51 @@ export const useFleetSocket = (): UseFleetSocketReturn => {
     }, [startPolling]);
 
     // publishCommand: send via fleet_gateway GraphQL mutation
-    const publishCommand = useCallback((
+    const publishCommand = useCallback(async (
         robotId: number | string,
         command: RobotCommand['command'],
+        payload?: Partial<RobotCommand>,
     ) => {
-        // Commands to real robots go through fleet_gateway GraphQL (fire-and-forget)
-        console.log(`[FleetSocket] Command ${command} → Robot ${robotId}`);
-    }, []);
+        const inferredRobotName =
+            payload?.robotName
+            ?? (typeof robotId === 'string' ? robotId : VEHICLE_ROBOT_MAP[Math.max(Number(robotId) - 1, 0)])
+            ?? String(robotId);
+
+        console.log(`[FleetSocket] Sending Command ${command} → Robot ${inferredRobotName}`);
+        addLog(`[System] Executing ${command} on ${inferredRobotName}...`);
+
+        try {
+            const query = `
+                mutation SendCommand($robotName: String!, $command: String!) {
+                    sendRobotCommand(robotName: $robotName, command: $command) {
+                        success
+                        message
+                    }
+                }
+            `;
+
+            const res = await fetch(FLEET_GW_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    query,
+                    variables: { robotName: inferredRobotName, command }
+                }),
+                signal: AbortSignal.timeout(5000),
+            });
+
+            if (!res.ok) throw new Error(`HTTP Error ${res.status}`);
+
+            const body = await res.json();
+            if (body.errors?.length) throw new Error(body.errors[0].message);
+
+            addLog(`[System] ${command} sent successfully to ${inferredRobotName}`);
+
+        } catch (err) {
+            console.error(`[FleetSocket] Failed to send ${command}:`, err);
+            addLog(`[Error] Failed to send ${command} to ${inferredRobotName}`);
+        }
+    }, [addLog]);
 
     useEffect(() => {
         isMountedRef.current = true;

@@ -21,7 +21,7 @@ const FleetInterface: React.FC = () => {
   /** Called by Optimization when user clicks "Dispatch to Fleet" */
   const handleDispatch = useCallback((
     expandedRoutes: number[][],
-    vrpWaypoints: number[][],
+    _vrpWaypoints: number[][],
     nodes: DBNode[],
   ) => {
     setSimulationRoutes(expandedRoutes);
@@ -30,7 +30,9 @@ const FleetInterface: React.FC = () => {
     // Fire-and-forget: send travel orders to each mapped robot via Fleet Gateway
     expandedRoutes.forEach((_, vehicleIndex) => {
       if (!(vehicleIndex in VEHICLE_ROBOT_MAP)) return;
-      const waypoints = vrpWaypoints[vehicleIndex] ?? [];
+
+      const waypoints = expandedRoutes[vehicleIndex] ?? [];
+
       dispatchVehicleRoute(vehicleIndex, waypoints, nodes).then(result => {
         console.log(
           `[FleetInterface] Vehicle ${vehicleIndex + 1} dispatch complete:`,
@@ -86,7 +88,7 @@ const FleetInterface: React.FC = () => {
               <Activity size={14} /> FLEET
             </button>
           </div>
-          
+
           <div className="h-6 w-px bg-gray-200 dark:bg-white/10 ml-2"></div>
           <ThemeToggle />
         </div>

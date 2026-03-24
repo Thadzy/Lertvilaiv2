@@ -54,6 +54,7 @@ import { type DBRobot, type DBNode, type DBEdge } from "../types/database";
 import { useFleetSocket, type ConnectionStatus } from "../hooks/useFleetSocket";
 import { useThemeStore } from "../store/themeStore";
 import WaypointNode from "./nodes/WaypointNode";
+import { cancelAllDispatches, setFleetPaused } from "../utils/fleetGateway";
 
 
 // ============================================
@@ -251,19 +252,19 @@ ConnectionStatusBadge.displayName = "ConnectionStatusBadge";
  */
 const RobotTableRow = memo<{
   robot: FleetRobot;
-  onCommand: (robotId: number, command: string) => void;
+  onCommand: (robotId: number, command: string, robotName: string) => void;
 }>(({ robot, onCommand }) => {
   const handlePause = useCallback(
-    () => onCommand(robot.id, "PAUSE"),
-    [robot.id, onCommand],
+    () => onCommand(robot.id, "PAUSE", robot.name),
+    [robot.id, robot.name, onCommand],
   );
   const handleResume = useCallback(
-    () => onCommand(robot.id, "RESUME"),
-    [robot.id, onCommand],
+    () => onCommand(robot.id, "RESUME", robot.name),
+    [robot.id, robot.name, onCommand],
   );
   const handleEstop = useCallback(
-    () => onCommand(robot.id, "ESTOP"),
-    [robot.id, onCommand],
+    () => onCommand(robot.id, "ESTOP", robot.name),
+    [robot.id, robot.name, onCommand],
   );
 
   return (
@@ -838,9 +839,20 @@ const FleetController: React.FC<FleetControllerProps> = ({ graphId, simulationRo
 
   // --- COMMAND HANDLER (stable callback) ---
   const handleCommand = useCallback(
-    (robotId: number, command: string) => {
+    (robotId: number, command: string, robotName: string) => {
       console.log(`[FleetController] Sending ${command} to Robot ${robotId}`);
-      publishCommand(robotId, command as "PAUSE" | "RESUME" | "ESTOP");
+      if (command === "PAUSE") {
+        setFleetPaused(true);
+        simPausedRef.current = true;
+      } else if (command === "RESUME") {
+        setFleetPaused(false);
+        simPausedRef.current = false;
+      } else if (command === "ESTOP" || command === "CANCEL") {
+        setFleetPaused(true);
+        simPausedRef.current = true;
+        cancelAllDispatches();
+      }
+      publishCommand(robotId, command as "PAUSE" | "RESUME" | "ESTOP" | "CANCEL", { robotName });
     },
     [publishCommand],
   );

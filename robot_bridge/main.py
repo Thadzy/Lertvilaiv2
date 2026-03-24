@@ -94,36 +94,68 @@ async def _receive_topics(r: redis_async.Redis, ws):
 
 
 async def _command_relay(r: redis_async.Redis, ws):
-    """Subscribe to Redis command channel and forward travel orders to rosbridge."""
+    """Subscribe to Redis command channel and forward travel/control orders to rosbridge."""
     pubsub = r.pubsub()
     channel = f"robot:{ROBOT_NAME}:command"
     await pubsub.subscribe(channel)
     log.info(f"Subscribed to Redis channel {channel}")
+    last_travel_target: dict | None = None
+
+    async def publish_travel(alias: str, x: float, y: float):
+        nav_data = json.dumps({
+            "alias": alias,
+            "x": x,
+            "y": y,
+        })
+        ros_payload = {
+            "op": "publish",
+            "topic": "/travel_command",
+            "msg": {"data": nav_data},
+        }
+        ros_payload_str = json.dumps(ros_payload)
+        log.info(f"Sending to ROS2: {ros_payload_str}")
+        await ws.send(ros_payload_str)
     try:
         async for message in pubsub.listen():
             if message["type"] != "message":
                 continue
             try:
                 cmd = json.loads(message["data"])
-                if cmd.get("op") == "travel":
+                op = cmd.get("op")
+                if op == "travel":
                     m = cmd.get("msg", {})
                     target_alias = m.get("target_alias", "")
                     target_x     = m.get("target_x")
                     target_y     = m.get("target_y")
+                    x = target_x if target_x is not None else 0.0
+                    y = target_y if target_y is not None else 0.0
+                    last_travel_target = {"alias": target_alias, "x": x, "y": y}
+                    await publish_travel(target_alias, x, y)
+                elif op == "control":
+                    m = cmd.get("msg", {})
+                    action = str(m.get("command", cmd.get("command", ""))).upper().strip()
 
-                    # msg.data is a JSON string so pose_publisher can parse x,y
-                    nav_data = json.dumps({
-                        "alias": target_alias,
-                        "x": target_x if target_x is not None else 0.0,
-                        "y": target_y if target_y is not None else 0.0,
-                    })
-                    ros_payload = {
-                        "op": "publish",
-                        "topic": "/travel_command",
-                        "msg": {"data": nav_data},
-                    }
-                    ros_payload_str = json.dumps(ros_payload)
-                    log.info(f"Sending to ROS2: {ros_payload_str}")
+                    # The simulator only consumes /travel_command; to stop motion we publish
+                    # a "travel to current pose" command so it immediately snaps to IDLE.
+                    if action in {"PAUSE", "ESTOP", "CANCEL"}:
+                        current = robot_state.get("mobileBaseState", {})
+                        stop_alias = current.get("qr_id") or action
+                        stop_x = float(current.get("x", 0.0))
+                        stop_y = float(current.get("y", 0.0))
+                        await publish_travel(str(stop_alias), stop_x, stop_y)
+                        log.info(f"Applied control command {action} by freezing at ({stop_x}, {stop_y})")
+                    elif action == "RESUME":
+                        if last_travel_target is None:
+                            log.warning("RESUME received but no prior travel target is available")
+                            continue
+                        await publish_travel(
+                            str(last_travel_target.get("alias", "")),
+                            float(last_travel_target.get("x", 0.0)),
+                            float(last_travel_target.get("y", 0.0)),
+                        )
+                        log.info("Applied RESUME by re-sending previous travel target")
+                    else:
+                        log.warning(f"Ignoring unknown control command: {action}")
                     await ws.send(ros_payload_str)
             except Exception as e:
                 log.error(f"Command relay error processing message: {e}")
