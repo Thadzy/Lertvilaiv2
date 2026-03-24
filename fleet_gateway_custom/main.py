@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import os
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 from enum import Enum
 from typing import AsyncGenerator, Optional
@@ -28,6 +30,7 @@ from strawberry.fastapi import GraphQLRouter
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 ROBOTS_CONFIG: dict = json.loads(os.getenv("ROBOTS_CONFIG", "{}"))
+log = logging.getLogger(__name__)
 
 # ── Enums ─────────────────────────────────────────────────────────────────────
 @strawberry.enum
@@ -197,12 +200,34 @@ class TravelOrderInput:
 # ── Redis helpers ─────────────────────────────────────────────────────────────
 _redis: Optional[aioredis.Redis] = None
 
-
-async def get_redis() -> aioredis.Redis:
+async def get_redis(force_reconnect: bool = False) -> aioredis.Redis:
     global _redis
+    if force_reconnect and _redis is not None:
+        try:
+            await _redis.aclose()
+        except Exception:
+            pass
+        _redis = None
     if _redis is None:
         _redis = aioredis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
     return _redis
+
+
+async def with_redis(label: str, op, fallback=None):
+    """
+    Execute a Redis operation with one reconnect retry. Returns `fallback`
+    instead of raising when fallback is provided.
+    """
+    for attempt in range(2):
+        try:
+            r = await get_redis(force_reconnect=(attempt > 0))
+            return await op(r)
+        except Exception as exc:
+            log.error(f"Redis {label} failed (attempt {attempt + 1}/2): {exc}")
+            await asyncio.sleep(0.2)
+    if fallback is not None:
+        return fallback
+    raise RuntimeError(f"Redis {label} failed after retries")
 
 
 def _parse_robot_state(name: str, raw: Optional[str], heartbeat: Optional[str]) -> Robot:
@@ -275,11 +300,13 @@ def _parse_robot_state(name: str, raw: Optional[str], heartbeat: Optional[str]) 
 
 
 async def fetch_robot(name: str) -> Robot:
-    r = await get_redis()
     state_key = f"robot:{name}:state"
     heartbeat_key = f"robot:{name}:heartbeat"
-
-    raw, heartbeat = await r.mget(state_key, heartbeat_key)
+    raw, heartbeat = await with_redis(
+        f"mget:{name}",
+        lambda r: r.mget(state_key, heartbeat_key),
+        fallback=(None, None),
+    )
     return _parse_robot_state(name, raw, heartbeat)
 
 
@@ -344,8 +371,10 @@ class Mutation:
             },
         })
         try:
-            r = await get_redis()
-            await r.publish(channel, command)
+            await with_redis(
+                f"publish:{channel}",
+                lambda r: r.publish(channel, command),
+            )
             return JobOrderResult(
                 success=True,
                 message=f"Pickup order dispatched to {order.robot_name}",
@@ -381,8 +410,10 @@ class Mutation:
             },
         })
         try:
-            r = await get_redis()
-            await r.publish(channel, command)
+            await with_redis(
+                f"publish:{channel}",
+                lambda r: r.publish(channel, command),
+            )
             return JobOrderResult(
                 success=True,
                 message=f"Delivery order dispatched to {order.robot_name}",
@@ -419,8 +450,10 @@ class Mutation:
             },
         })
         try:
-            r = await get_redis()
-            await r.publish(channel, command)
+            await with_redis(
+                f"publish:{channel}",
+                lambda r: r.publish(channel, command),
+            )
             return JobOrderResult(
                 success=True,
                 message=f"Travel order dispatched to {order.robot_name}",
@@ -460,8 +493,10 @@ class Mutation:
             },
         })
         try:
-            r = await get_redis()
-            await r.publish(channel, payload)
+            await with_redis(
+                f"publish:{channel}",
+                lambda r: r.publish(channel, payload),
+            )
             return JobOrderResult(
                 success=True,
                 message=f"{command_map[normalized]} dispatched to {robot_name}",
@@ -493,41 +528,67 @@ class Mutation:
 class Subscription:
     @strawberry.subscription(description="Subscribe to all robots' state updates.")
     async def robots(self) -> AsyncGenerator[list[Robot], None]:
-        r = await get_redis()
-        pubsub = r.pubsub()
         robot_names = list(ROBOTS_CONFIG.keys())
         channels = [f"robot:{name}" for name in robot_names]
-        await pubsub.subscribe(*channels)
-        try:
-            async for message in pubsub.listen():
-                if message["type"] == "message":
-                    yield await fetch_all_robots()
-        finally:
-            await pubsub.unsubscribe(*channels)
+        while True:
+            pubsub = None
+            try:
+                r = await get_redis()
+                pubsub = r.pubsub()
+                await pubsub.subscribe(*channels)
+                async for message in pubsub.listen():
+                    if message.get("type") == "message":
+                        yield await fetch_all_robots()
+            except Exception as exc:
+                log.error(f"Redis subscription error (robots): {exc}. Reconnecting...")
+                await asyncio.sleep(0.5)
+            finally:
+                if pubsub is not None:
+                    try:
+                        await pubsub.unsubscribe(*channels)
+                    except Exception:
+                        pass
+                    try:
+                        await pubsub.aclose()
+                    except Exception:
+                        pass
 
     @strawberry.subscription(description="Subscribe to a specific robot's state updates.")
     async def robot(self, name: str) -> AsyncGenerator[Optional[Robot], None]:
         if name not in ROBOTS_CONFIG:
             yield None
             return
-        r = await get_redis()
-        pubsub = r.pubsub()
         channel = f"robot:{name}"
-        await pubsub.subscribe(channel)
-        try:
-            async for message in pubsub.listen():
-                if message["type"] == "message":
-                    yield await fetch_robot(name)
-        finally:
-            await pubsub.unsubscribe(channel)
+        while True:
+            pubsub = None
+            try:
+                r = await get_redis()
+                pubsub = r.pubsub()
+                await pubsub.subscribe(channel)
+                async for message in pubsub.listen():
+                    if message.get("type") == "message":
+                        yield await fetch_robot(name)
+            except Exception as exc:
+                log.error(f"Redis subscription error (robot:{name}): {exc}. Reconnecting...")
+                await asyncio.sleep(0.5)
+            finally:
+                if pubsub is not None:
+                    try:
+                        await pubsub.unsubscribe(channel)
+                    except Exception:
+                        pass
+                    try:
+                        await pubsub.aclose()
+                    except Exception:
+                        pass
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    r = await get_redis()
     for _ in range(30):
         try:
+            r = await get_redis(force_reconnect=(_ > 0))
             await r.ping()
             print(f"Redis connected at {REDIS_HOST}:{REDIS_PORT}")
             break

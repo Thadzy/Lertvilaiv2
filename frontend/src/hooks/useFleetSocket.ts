@@ -18,6 +18,7 @@ import { VEHICLE_ROBOT_MAP } from '../utils/fleetGateway';
 // ============================================
 
 const FLEET_GW_URL = '/api/fleet/graphql';
+const KNOWN_ROBOT_NAMES = Array.from(new Set(Object.values(VEHICLE_ROBOT_MAP)));
 
 /** How often to poll fleet_gateway for robot state (ms) */
 const POLL_INTERVAL_MS = 200;
@@ -98,10 +99,41 @@ export const useFleetSocket = (): UseFleetSocketReturn => {
 
     const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const isMountedRef = useRef(true);
+    const connectionStatusRef = useRef<ConnectionStatus>('disconnected');
+    const robotStatesRef = useRef<Record<string, RobotStatusMessage>>({});
 
     const addLog = useCallback((msg: string) => {
         setLogs(prev => [msg, ...prev].slice(0, 50));
     }, []);
+
+    const markRobotsOffline = useCallback((reason: string) => {
+        /**
+         * On backend degradation (timeout/5xx), preserve known robot rows but
+         * force status to OFFLINE so the UI can fail-safe instead of showing
+         * stale ONLINE telemetry.
+         */
+        setRobotStates((prev) => {
+            const names = new Set<string>([
+                ...KNOWN_ROBOT_NAMES,
+                ...Object.keys(prev),
+            ]);
+            const next: Record<string, RobotStatusMessage> = {};
+            names.forEach((name) => {
+                const existing = prev[name];
+                next[name] = {
+                    id: existing?.id ?? name,
+                    status: 'offline',
+                    battery: existing?.battery ?? 0,
+                    x: existing?.x ?? 0,
+                    y: existing?.y ?? 0,
+                    angle: existing?.angle ?? 0,
+                    current_task_id: existing?.current_task_id ?? null,
+                };
+            });
+            return next;
+        });
+        addLog(`[FleetSocket] Poll degraded (${reason}); fleet marked offline.`);
+    }, [addLog]);
 
     const poll = useCallback(async () => {
         try {
@@ -112,15 +144,31 @@ export const useFleetSocket = (): UseFleetSocketReturn => {
                 signal: AbortSignal.timeout(3000),
             });
 
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            if (!res.ok) throw new Error(`HTTP_${res.status}`);
 
             const body = await res.json();
             if (body.errors?.length) throw new Error(body.errors[0].message);
 
             if (!isMountedRef.current) return;
 
-            const gqlRobots: GqlRobot[] = body.data?.robots ?? [];
+            const gqlRobots: GqlRobot[] = Array.isArray(body?.data?.robots) ? body.data.robots : [];
             const next: Record<string, RobotStatusMessage> = {};
+            const knownNames = new Set<string>([
+                ...KNOWN_ROBOT_NAMES,
+                ...Object.keys(robotStatesRef.current),
+            ]);
+
+            knownNames.forEach((name) => {
+                next[name] = {
+                    id: name,
+                    status: 'offline',
+                    battery: robotStatesRef.current[name]?.battery ?? 0,
+                    x: robotStatesRef.current[name]?.x ?? 0,
+                    y: robotStatesRef.current[name]?.y ?? 0,
+                    angle: robotStatesRef.current[name]?.angle ?? 0,
+                    current_task_id: robotStatesRef.current[name]?.current_task_id ?? null,
+                };
+            });
 
             gqlRobots.forEach((r) => {
                 const pose = r.mobileBaseState?.pose;
@@ -130,7 +178,7 @@ export const useFleetSocket = (): UseFleetSocketReturn => {
                     status = 'idle';
                 }
 
-                const entry: RobotStatusMessage = {
+                next[r.name] = {
                     id: r.name,
                     status,
                     battery: 100,
@@ -138,33 +186,46 @@ export const useFleetSocket = (): UseFleetSocketReturn => {
                     y: pose?.y ?? 0,
                     angle: 0,
                 };
-
-                next[r.name] = entry;
             });
 
             setRobotStates(next);
 
-            if (connectionStatus !== 'connected') {
+            if (connectionStatusRef.current !== 'connected') {
                 setConnectionStatus('connected');
+                connectionStatusRef.current = 'connected';
                 setReconnectAttempts(0);
             }
         } catch (err) {
             if (!isMountedRef.current) return;
             console.error('[FleetSocket] Poll Error:', err);
-            if (connectionStatus === 'connected') {
+
+            const message = err instanceof Error ? err.message : String(err);
+            const timeoutOr5xx =
+                message.includes('HTTP_5') ||
+                message.includes('Timeout') ||
+                message.includes('AbortError') ||
+                message.includes('aborted');
+            if (timeoutOr5xx) {
+                markRobotsOffline(message);
+            }
+
+            if (connectionStatusRef.current === 'connected') {
                 console.warn('[FleetSocket] Poll failed:', err);
                 setConnectionStatus('reconnecting');
+                connectionStatusRef.current = 'reconnecting';
                 setReconnectAttempts(prev => prev + 1);
             } else {
                 setConnectionStatus('disconnected');
+                connectionStatusRef.current = 'disconnected';
             }
         }
-    }, [connectionStatus]);
+    }, [markRobotsOffline]);
 
     // Start / restart polling
     const startPolling = useCallback(() => {
         if (intervalRef.current) clearInterval(intervalRef.current);
         setConnectionStatus('connecting');
+        connectionStatusRef.current = 'connecting';
         poll(); // immediate first call
         intervalRef.current = setInterval(poll, POLL_INTERVAL_MS);
     }, [poll]);
@@ -230,6 +291,14 @@ export const useFleetSocket = (): UseFleetSocketReturn => {
             if (intervalRef.current) clearInterval(intervalRef.current);
         };
     }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+    useEffect(() => {
+        robotStatesRef.current = robotStates;
+    }, [robotStates]);
+
+    useEffect(() => {
+        connectionStatusRef.current = connectionStatus;
+    }, [connectionStatus]);
 
     const isConnected = connectionStatus === 'connected';
 

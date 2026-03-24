@@ -5,7 +5,7 @@ import GraphEditor from './GraphEditor';
 import Optimization from './Optimization';
 import FleetController from './FleetController';
 import ThemeToggle from './ThemeToggle';
-import { dispatchVehicleRoute, VEHICLE_ROBOT_MAP } from '../utils/fleetGateway';
+import { beginNewDispatchBatch, dispatchVehicleRoute, VEHICLE_ROBOT_MAP } from '../utils/fleetGateway';
 import { type DBNode } from '../types/database';
 
 
@@ -26,6 +26,7 @@ const FleetInterface: React.FC = () => {
   ) => {
     setSimulationRoutes(expandedRoutes);
     setActiveTab('fleet');
+    beginNewDispatchBatch();
 
     // Fire-and-forget: send travel orders to each mapped robot via Fleet Gateway
     expandedRoutes.forEach((_, vehicleIndex) => {

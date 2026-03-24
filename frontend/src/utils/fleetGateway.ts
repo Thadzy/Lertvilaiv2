@@ -39,6 +39,15 @@ export const VEHICLE_ROBOT_MAP: Record<number, string> = {
   0: 'SIMBOT',
 } as const;
 
+/**
+ * Resolve a safe fallback robot when a vehicle index is missing from
+ * VEHICLE_ROBOT_MAP. This prevents hard crashes from undefined lookups while
+ * still preserving deterministic dispatch behavior.
+ */
+const getFallbackRobotName = (): string => {
+  return VEHICLE_ROBOT_MAP[0] ?? Object.values(VEHICLE_ROBOT_MAP)[0] ?? 'SIMBOT';
+};
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -183,6 +192,18 @@ export const setFleetPaused = (state: boolean): void => {
 };
 
 /**
+ * Abort any previous dispatch batch and create a fresh AbortController.
+ * Call this once before starting a new multi-vehicle dispatch to guarantee
+ * rapid repeated clicks cannot create overlapping command loops.
+ */
+export const beginNewDispatchBatch = (): AbortSignal => {
+  dispatchAbortController.abort();
+  dispatchAbortController = new AbortController();
+  isFleetPaused = false;
+  return dispatchAbortController.signal;
+};
+
+/**
  * Dispatch all key waypoints of a VRP vehicle route to its assigned robot.
  *
  * ## Vehicle → Robot mapping
@@ -214,13 +235,7 @@ export async function dispatchVehicleRoute(
   nodes: DBNode[],
 ): Promise<RouteDispatchResult> {
   // Look up the robot name for this vehicle slot
-  const robotName = VEHICLE_ROBOT_MAP[vehicleIndex];
-  if (!robotName) {
-    throw new Error(
-      `No robot is mapped to vehicle index ${vehicleIndex}. ` +
-      `Add an entry to VEHICLE_ROBOT_MAP in fleetGateway.ts.`,
-    );
-  }
+  const robotName = VEHICLE_ROBOT_MAP[vehicleIndex] ?? getFallbackRobotName();
 
   // Build a fast lookup: nodeId → { alias, type, x, y }
   const nodeInfo = new Map<number, { alias: string; type: string; x: number; y: number }>(
@@ -235,6 +250,11 @@ export async function dispatchVehicleRoute(
     `[Fleet] Dispatching Vehicle ${vehicleIndex + 1} → ${robotName} ` +
     `(${vrpWaypoints.length} waypoints)`,
   );
+  if (!(vehicleIndex in VEHICLE_ROBOT_MAP)) {
+    log.push(
+      `[System] Vehicle ${vehicleIndex + 1} has no explicit mapping; using fallback robot ${robotName}.`,
+    );
+  }
 
   // ดึงค่า signal ปัจจุบันมาใช้ในลูปนี้
   const signal = dispatchAbortController.signal;

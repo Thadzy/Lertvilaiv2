@@ -652,7 +652,7 @@ const FleetController: React.FC<FleetControllerProps> = ({ graphId, simulationRo
     // Set initial path details for table
     const initialPathDetails = new Map<number, string[]>();
     simulationRoutes.forEach((route, vi) => {
-      const aliases = route.map((nid) => nodeAliasMap.get(nid) || `Node ${nid}`);
+      const aliases = route.map((nid) => nodeAliasMapRef.current.get(nid) ?? `Node ${nid}`);
       initialPathDetails.set(vi, aliases);
     });
     setRobotPathDetails(initialPathDetails);
@@ -661,10 +661,18 @@ const FleetController: React.FC<FleetControllerProps> = ({ graphId, simulationRo
     const simEdges: Edge[] = [];
     simulationRoutes.forEach((route, vi) => {
       for (let i = 0; i < route.length - 1; i++) {
+        const sourceId = route[i];
+        const targetId = route[i + 1];
+        if (sourceId === undefined || targetId === undefined) continue;
+        /**
+         * React Flow can error when an edge references a node ID that does not
+         * exist in the current graph state. We skip invalid pairs defensively.
+         */
+        if (!getNodePos(sourceId) || !getNodePos(targetId)) continue;
         simEdges.push({
           id: `sim-path-${vi}-${i}`,
-          source: String(route[i]),
-          target: String(route[i + 1]),
+          source: String(sourceId),
+          target: String(targetId),
           animated: true,
           style: { stroke: VEHICLE_COLORS[vi % VEHICLE_COLORS.length], strokeWidth: 3 },
           zIndex: 5,
@@ -778,7 +786,7 @@ const FleetController: React.FC<FleetControllerProps> = ({ graphId, simulationRo
           const asnTasks = tasks.filter((t) => t.assignment_id === asn.id);
           if (asnTasks.length === 0) return;
 
-          const bot = robots.find((r) => r.id === asn.robot_id) || robots[0];
+          const bot = robots.find((r) => r.id === asn.robot_id);
           let prevSource = bot ? `robot-${bot.id}` : null;
           let prevSourceHandle = "mobile-source";
 
@@ -787,13 +795,14 @@ const FleetController: React.FC<FleetControllerProps> = ({ graphId, simulationRo
 
           asnTasks.forEach((task, i) => {
             const targetNodeId = cellMap.get(task.cell_id);
-            if (!targetNodeId) return;
+            if (targetNodeId === undefined || targetNodeId === null) return;
 
             // Get Alias
-            const alias = nodeAliasMap.get(targetNodeId);
-            if (alias) aliasSequence.push(alias);
+            const alias = nodeAliasMap.get(targetNodeId) ?? `Node ${targetNodeId}`;
+            aliasSequence.push(alias);
 
             const targetHandle = targetNodeId.toString();
+            if (!nodePositionsRef.current.has(targetHandle)) return;
 
             if (prevSource) {
               pathEdges.push({
