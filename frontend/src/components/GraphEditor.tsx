@@ -753,7 +753,11 @@ const GraphEditor: React.FC<GraphEditorProps> = ({ graphId, visualizedPath = [] 
                 )}
               </div>
 
-              <button onClick={handleDelete} className="p-2 text-slate-500 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all" title="Delete Selected">
+              <button
+                onMouseDown={(e) => { e.preventDefault(); handleDelete(); }}
+                className="p-2 text-slate-500 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all"
+                title="Delete Selected"
+              >
                 <Trash2 size={18} />
               </button>
             </div>

@@ -78,6 +78,7 @@ const Optimization: React.FC<OptimizationProps> = ({ graphId, onDispatch }) => {
 
   // -- Fleet config --
   const [vehicleCount, setVehicleCount] = useState<number>(2);
+  const [vehicleCapacity, setVehicleCapacity] = useState<number>(10);
 
   // -- Solver state --
   const [isSolving, setIsSolving] = useState(false);
@@ -275,6 +276,12 @@ const Optimization: React.FC<OptimizationProps> = ({ graphId, onDispatch }) => {
         distMatrix = generateDistanceMatrix(map.nodes, map.edges);
       }
 
+      // Resolve start node for each vehicle (all vehicles start at the same point)
+      const startNodeId = map ? resolveStartNode(map.nodes) : null;
+      const robotLocations = startNodeId
+        ? Array(vehicleCount).fill(startNodeId)
+        : undefined;
+
       const { paths, server } = await solveVRP(
         {
           graph_id: graphId,
@@ -284,6 +291,8 @@ const Optimization: React.FC<OptimizationProps> = ({ graphId, onDispatch }) => {
             pickup: parseInt(t.pickup),
             delivery: parseInt(t.delivery),
           })),
+          robot_locations: robotLocations,
+          vehicle_capacity: vehicleCapacity,
         },
         map?.nodes || [],
         distMatrix,
@@ -422,6 +431,18 @@ const Optimization: React.FC<OptimizationProps> = ({ graphId, onDispatch }) => {
               <input
                 type="number" min="1" max="10" value={vehicleCount}
                 onChange={e => setVehicleCount(Math.max(1, parseInt(e.target.value) || 1))}
+                className="w-full text-sm p-2 border border-gray-200 dark:border-white/10 rounded-lg font-mono font-bold bg-gray-50 dark:bg-white/5"
+              />
+            </div>
+
+            {/* Vehicle Capacity */}
+            <div>
+              <label className="text-[10px] text-gray-500 dark:text-gray-400 font-bold uppercase block mb-2">
+                Max Tasks per Vehicle
+              </label>
+              <input
+                type="number" min="1" max="100" value={vehicleCapacity}
+                onChange={e => setVehicleCapacity(Math.max(1, parseInt(e.target.value) || 1))}
                 className="w-full text-sm p-2 border border-gray-200 dark:border-white/10 rounded-lg font-mono font-bold bg-gray-50 dark:bg-white/5"
               />
             </div>

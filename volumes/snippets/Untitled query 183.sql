@@ -1,0 +1,1 @@
+SELECT * FROM public.wh_edges LIMIT 10;

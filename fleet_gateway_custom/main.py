@@ -24,13 +24,34 @@ from datetime import datetime, timezone
 import redis.asyncio as aioredis
 import strawberry
 from fastapi import FastAPI
+
+# Ensure application-level loggers (route_oracle, vrp_client, etc.) emit INFO
+# to stdout.  Uvicorn's dictConfig leaves the root logger without a handler,
+# so propagated records would be silently dropped without this call.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s:%(name)s - %(message)s",
+    force=True,  # override any prior config (e.g. from uvicorn startup)
+)
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from strawberry.fastapi import GraphQLRouter
+
+from vrp_client import (
+    PickupDeliveryTask,
+    VrpSolveRequest,
+    solve as vrp_solve,
+)
+from route_oracle import log_vehicle_routes
+from route_oracle import expand_path_with_coords
 
 # ── Config ────────────────────────────────────────────────────────────────────
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 ROBOTS_CONFIG: dict = json.loads(os.getenv("ROBOTS_CONFIG", "{}"))
 log = logging.getLogger(__name__)
+ACTION_SYNC_TIMEOUT_S = float(os.getenv("ACTION_SYNC_TIMEOUT_S", "300"))
+ACTION_SYNC_POLL_S = 1.0
 
 # ── Enums ─────────────────────────────────────────────────────────────────────
 @strawberry.enum
@@ -197,6 +218,19 @@ class TravelOrderInput:
     target_y: Optional[float] = None  # Metres — forwarded to robot for navigation
 
 
+@strawberry.input
+class ExecutePathOrderInput:
+    """Closed-loop path execution request.
+
+    The caller provides a high-level VRP path (node IDs). Fleet gateway expands
+    it to concrete waypoints via route_oracle and publishes one ``execute_path``
+    command for atomic robot-side batch execution.
+    """
+    robot_name: str
+    graph_id: int
+    vrp_path: list[int]
+
+
 # ── Redis helpers ─────────────────────────────────────────────────────────────
 _redis: Optional[aioredis.Redis] = None
 
@@ -315,6 +349,104 @@ async def fetch_all_robots() -> list[Robot]:
     return [await fetch_robot(name) for name in robot_names]
 
 
+async def _dispatch_execute_path_and_wait(
+    *,
+    robot_name: str,
+    graph_id: int,
+    vrp_path: list[int],
+) -> JobOrderResult:
+    """Dispatch a full expanded path and block until robot reaches terminal state.
+
+    This is the closed-loop replacement for legacy waypoint-by-waypoint dispatch.
+    Instead of publishing many ``travel`` commands with artificial sleeps, we:
+    1) expand the VRP path to concrete waypoints (alias + x + y),
+    2) publish one ``execute_path`` payload to Redis,
+    3) poll robot runtime status until the action finishes (IDLE) or fails (ERROR).
+
+    Args:
+        robot_name: Robot identifier used in Redis channel naming.
+        graph_id: Warehouse graph ID for A* expansion in route_oracle.
+        vrp_path: High-level VRP node ID path.
+
+    Returns:
+        JobOrderResult indicating terminal dispatch outcome.
+    """
+    waypoints = await expand_path_with_coords(graph_id, vrp_path)
+    if not waypoints:
+        return JobOrderResult(
+            success=False,
+            message=(
+                "Failed to expand VRP path into executable waypoints. "
+                "Dispatch aborted before publish."
+            ),
+        )
+
+    channel = f"robot:{robot_name}:command"
+    payload = json.dumps(
+        {
+            "op": "execute_path",
+            "waypoints": waypoints,
+        }
+    )
+
+    try:
+        await with_redis(
+            f"publish:{channel}",
+            lambda r: r.publish(channel, payload),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return JobOrderResult(
+            success=False,
+            message=f"Redis error dispatching execute_path to {robot_name}: {exc}",
+        )
+
+    # Closed-loop synchronization:
+    # Do not treat dispatch as successful until runtime status settles.
+    # IDLE => action completed; ERROR => action failed/timed out downstream.
+    started_at = asyncio.get_event_loop().time()
+    while (asyncio.get_event_loop().time() - started_at) < ACTION_SYNC_TIMEOUT_S:
+        robot = await fetch_robot(robot_name)
+        action = robot.last_action_status.value
+        connection = robot.connection_status.value
+
+        if connection == RobotConnectionStatus.OFFLINE.value:
+            return JobOrderResult(
+                success=False,
+                message=(
+                    f"Robot {robot_name} went OFFLINE while executing batch path. "
+                    "Marked as failed."
+                ),
+            )
+
+        if action == RobotActionStatus.IDLE.value:
+            return JobOrderResult(
+                success=True,
+                message=(
+                    f"execute_path dispatched and completed for {robot_name} "
+                    f"({len(waypoints)} waypoints)."
+                ),
+            )
+
+        if action == RobotActionStatus.ERROR.value:
+            return JobOrderResult(
+                success=False,
+                message=(
+                    f"Robot {robot_name} reported ERROR during execute_path. "
+                    "Marked as failed."
+                ),
+            )
+
+        await asyncio.sleep(ACTION_SYNC_POLL_S)
+
+    return JobOrderResult(
+        success=False,
+        message=(
+            f"Timed out waiting for {robot_name} to finish execute_path "
+            f"(>{ACTION_SYNC_TIMEOUT_S:.0f}s). Marked as failed."
+        ),
+    )
+
+
 # ── GraphQL Schema ────────────────────────────────────────────────────────────
 @strawberry.type
 class Query:
@@ -347,6 +479,29 @@ class Query:
 
 @strawberry.type
 class Mutation:
+    @strawberry.mutation
+    async def execute_path_order(self, order: ExecutePathOrderInput) -> JobOrderResult:
+        """Dispatch and synchronize a full path execution in closed loop.
+
+        This mutation supersedes legacy per-waypoint travel loops in backend job
+        dispatch. It waits for terminal action status before returning so callers
+        can mark job records as DONE/ERROR based on this definitive result.
+        """
+        if not order.vrp_path or len(order.vrp_path) < 2:
+            return JobOrderResult(
+                success=False,
+                message="vrp_path must contain at least two node IDs.",
+            )
+        if order.robot_name not in ROBOTS_CONFIG:
+            return JobOrderResult(
+                success=False,
+                message=f"Unknown robot '{order.robot_name}'. Check ROBOTS_CONFIG.",
+            )
+        return await _dispatch_execute_path_and_wait(
+            robot_name=order.robot_name,
+            graph_id=order.graph_id,
+            vrp_path=order.vrp_path,
+        )
     @strawberry.mutation
     async def send_pickup_order(self, order: PickupOrderInput) -> JobOrderResult:
         """Dispatch a pickup order to the target robot via Redis pub/sub.
@@ -618,3 +773,147 @@ app.include_router(graphql_router, prefix="/graphql")
 @app.get("/health")
 async def health():
     return {"status": "ok", "robots": list(ROBOTS_CONFIG.keys())}
+
+
+# ── VRP REST API ───────────────────────────────────────────────────────────────
+
+class _VrpTaskPayload(BaseModel):
+    """A single pickup-delivery pair in a VRP solve request body."""
+    task_id: Optional[int] = None
+    pickup: int
+    delivery: int
+
+
+class _VrpSolveBody(BaseModel):
+    """Request body for ``POST /vrp/solve``.
+
+    Attributes:
+        graph_id: Warehouse graph ID in PostgreSQL.
+        num_vehicles: Number of robots available.
+        pickups_deliveries: List of pickup/delivery node ID pairs.
+        robot_locations: Starting node ID per vehicle.
+        vehicle_capacity: Max simultaneous items per vehicle.
+    """
+    graph_id: int
+    num_vehicles: int
+    pickups_deliveries: list[_VrpTaskPayload]
+    robot_locations: Optional[list[int]] = None
+    vehicle_capacity: Optional[int] = None
+
+
+@app.post("/vrp/solve")
+async def vrp_solve_endpoint(body: _VrpSolveBody) -> JSONResponse:
+    """Solve a VRP instance with pre-validation and automatic task decomposition.
+
+    This endpoint wraps the C++ OR-Tools VRP server with:
+
+    * **Pre-flight validation**: catches self-loops, empty queues, overcapacity.
+    * **Structured error codes**: returns ``error_code`` + ``error_message``
+      instead of raw HTTP 400 bodies.
+    * **Decomposition fallback**: when two tasks share the same pickup node,
+      the request is automatically split and results are merged.
+
+    Request body (JSON):
+
+    .. code-block:: json
+
+        {
+            "graph_id": 1,
+            "num_vehicles": 1,
+            "pickups_deliveries": [
+                {"task_id": 1, "pickup": 62, "delivery": 95},
+                {"task_id": 2, "pickup": 62, "delivery": 80}
+            ],
+            "robot_locations": [1],
+            "vehicle_capacity": 10
+        }
+
+    Successful response (200):
+
+    .. code-block:: json
+
+        {
+            "success": true,
+            "paths": [[1, 62, 95, 80, 1]],
+            "decomposed": false
+        }
+
+    Error response (422 or 200 with ``success: false``):
+
+    .. code-block:: json
+
+        {
+            "success": false,
+            "error_code": "OVERCAPACITY",
+            "error_message": "Overcapacity: 5 tasks but fleet handles at most 4..."
+        }
+    """
+    # Build the typed request object; constructor validates self-loops
+    try:
+        tasks = [
+            PickupDeliveryTask(
+                pickup_node_id=t.pickup,
+                delivery_node_id=t.delivery,
+                task_id=t.task_id,
+            )
+            for t in body.pickups_deliveries
+        ]
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "success": False,
+                "error_code": "VALIDATION_ERROR",
+                "error_message": str(exc),
+            },
+        )
+
+    req = VrpSolveRequest(
+        graph_id=body.graph_id,
+        num_vehicles=body.num_vehicles,
+        tasks=tasks,
+        robot_locations=body.robot_locations,
+        vehicle_capacity=body.vehicle_capacity,
+    )
+
+    result = await vrp_solve(req)
+
+    if result.success:
+        # Derive a display name for each vehicle.
+        # Uses robot names from ROBOTS_CONFIG when available, else "Vehicle-N".
+        robot_names = list(ROBOTS_CONFIG.keys())
+        vehicle_names = [
+            robot_names[i] if i < len(robot_names) else f"Vehicle-{i + 1}"
+            for i in range(len(result.paths))
+        ]
+
+        # Fire-and-forget: expand A* segments and log them without blocking
+        # the HTTP response.  Any error inside log_vehicle_routes is caught
+        # internally and emitted as a warning — it will never propagate here.
+        asyncio.create_task(
+            log_vehicle_routes(
+                graph_id=body.graph_id,
+                vehicle_names=vehicle_names,
+                paths=result.paths,
+            )
+        )
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "paths": result.paths,
+                "decomposed": result.decomposed,
+            },
+        )
+
+    # Map validation/overcapacity errors to 422; solver errors to 400
+    status = 422 if result.error_code == "VALIDATION_ERROR" else 400
+    return JSONResponse(
+        status_code=status,
+        content={
+            "success": False,
+            "error_code": result.error_code,
+            "error_message": result.error_message,
+        },
+    )

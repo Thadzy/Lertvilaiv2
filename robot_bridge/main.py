@@ -3,7 +3,7 @@
 Robot Bridge Service
 ====================
 Connects to robot_simulator (ROS2 rosbridge WebSocket) and feeds
-telemetry into Redis so fleet_gateway sees SIMBOT as ONLINE.
+telemetry into Redis so fleet_gateway sees FACOBOT as ONLINE.
 
 Redis key format (reverse-engineered from fleet_gateway behavior):
   robot:{robot_name}:state  -> JSON with robot state
@@ -16,6 +16,7 @@ so fleet_gateway keeps the robot as ONLINE.
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 import redis.asyncio as redis_async
@@ -24,7 +25,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 # ---------- Config ----------
-ROBOT_NAME = os.getenv("ROBOT_NAME", "SIMBOT")
+ROBOT_NAME = os.getenv("ROBOT_NAME", "FACOBOT")
 ROBOT_HOST = os.getenv("ROBOT_HOST", "robot_simulator")
 ROBOT_PORT = int(os.getenv("ROBOT_PORT", "9090"))
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
@@ -34,6 +35,14 @@ ODOM_STALE_TIMEOUT = float(os.getenv("ODOM_STALE_TIMEOUT", "5"))  # odom silence
 REDIS_RETRY_DELAY = float(os.getenv("REDIS_RETRY_DELAY", "2"))
 
 ROSBRIDGE_URI = f"ws://{ROBOT_HOST}:{ROBOT_PORT}"
+
+# ---------- Path-execution constants ----------
+# Distance (metres) within which the robot is considered to have "arrived" at a waypoint.
+ARRIVAL_TOLERANCE: float = float(os.getenv("ARRIVAL_TOLERANCE", "0.15"))
+# Maximum seconds to wait for the robot to reach a single waypoint before aborting.
+WAYPOINT_TIMEOUT: float = float(os.getenv("WAYPOINT_TIMEOUT", "60.0"))
+# Seconds between distance-check polls inside the arrival wait-loop.
+POLL_INTERVAL: float = float(os.getenv("POLL_INTERVAL", "0.5"))
 
 # ---------- State ----------
 robot_state = {
@@ -183,117 +192,248 @@ async def _receive_topics(ws):
         await push_to_redis()
 
 
+# Handle to the currently-running path-execution task so PAUSE/CANCEL can cancel it.
+_active_path_task: asyncio.Task | None = None
+
+
+async def _publish_travel(ws, alias: str, x: float, y: float) -> None:
+    
+    # Construct the internal command object
+    # Including 'th' and 'method' keys as identified during manual debugging
+    inner_cmd = {
+        "x": round(float(x), 4),
+        "y": round(float(y), 4),
+        "th": 0.0,
+        "method": "goto"
+    }
+    
+    # Standard std_msgs/String structure for rosbridge
+    command_data = json.dumps(inner_cmd)
+    ros_payload = json.dumps({
+        "op": "publish",
+        "topic": "/web_command_gateway",
+        "type": "std_msgs/msg/String",
+        "msg": {
+            "data": command_data
+        }
+    })
+    
+    log.info(f"→ ROS2 /web_command_gateway | target={alias} | payload: {command_data}")
+    await ws.send(ros_payload)
+
+
+async def _execute_path_waypoints(
+    ws,
+    waypoints: list[dict],
+) -> None:
+    """Execute a sequence of waypoints with closed-loop distance feedback.
+
+    For each waypoint the function:
+    1. Publishes the target to ``/travel_command``.
+    2. Polls ``robot_state["mobileBaseState"]`` (continuously refreshed by
+       ``_receive_topics``) until the Euclidean distance to the target falls
+       within ``ARRIVAL_TOLERANCE`` metres.
+    3. Moves on to the next waypoint, or aborts on timeout.
+
+    On timeout the robot's ``lastActionStatus`` is set to ``ERROR`` and the
+    function returns early, leaving it to the operator (or a higher-level
+    recovery routine) to cancel/re-plan.
+
+    Args:
+        ws: Live rosbridge WebSocket connection.
+        waypoints: Ordered list of ``{"alias": str, "x": float, "y": float}``
+            dicts representing the full A* path to execute.
+    """
+    total: int = len(waypoints)
+    log.info(f"[Path] Starting execution of {total} waypoint(s).")
+
+    for idx, waypoint in enumerate(waypoints, start=1):
+        alias: str = str(waypoint.get("alias") or "")
+        target_x: float = _safe_float(waypoint.get("x"), 0.0)
+        target_y: float = _safe_float(waypoint.get("y"), 0.0)
+
+        # --- Publish this waypoint ---
+        await _publish_travel(ws, alias, target_x, target_y)
+        log.info(f"[Path] Waypoint {idx}/{total}: target=({target_x:.3f}, {target_y:.3f})")
+
+        # --- Wait until the robot arrives (closed-loop check) ---
+        deadline: float = time.time() + WAYPOINT_TIMEOUT
+        while True:
+            current_x: float = _safe_float(robot_state["mobileBaseState"].get("x"), 0.0)
+            current_y: float = _safe_float(robot_state["mobileBaseState"].get("y"), 0.0)
+            distance: float = math.hypot(current_x - target_x, current_y - target_y)
+
+            if distance <= ARRIVAL_TOLERANCE:
+                log.info(
+                    f"[Path] Reached waypoint {idx}/{total} "
+                    f"(dist={distance:.3f} m ≤ {ARRIVAL_TOLERANCE} m tolerance)."
+                )
+                break
+
+            if time.time() > deadline:
+                log.error(
+                    f"[Path] TIMEOUT waiting for waypoint {idx}/{total} "
+                    f"alias={alias!r} target=({target_x:.3f}, {target_y:.3f}) — "
+                    f"current=({current_x:.3f}, {current_y:.3f}) dist={distance:.3f} m "
+                    f"after {WAYPOINT_TIMEOUT}s. Aborting path."
+                )
+                robot_state["lastActionStatus"] = "ERROR"
+                await push_to_redis()
+                return  # Abort: leave recovery to operator / higher-level planner
+
+            await asyncio.sleep(POLL_INTERVAL)
+
+    # All waypoints reached successfully
+    log.info("[Path] All waypoints reached. Path execution complete.")
+    robot_state["lastActionStatus"] = "IDLE"
+    await push_to_redis()
+
+
 async def _command_relay(ws):
-    """Subscribe to Redis command channel and forward travel/control orders to rosbridge."""
+    """Subscribe to Redis command channel and forward travel/control orders to rosbridge.
+
+    This coroutine runs for the lifetime of a single WebSocket connection.  Any
+    WebSocket-level error (send failure, connection closed) is intentionally
+    re-raised so that ``asyncio.gather`` in ``subscribe_to_rosbridge`` can cancel
+    ``_receive_topics`` and trigger a clean reconnect.  Only one Redis pubsub
+    subscription is ever active at a time, preventing duplicate command delivery.
+    """
+    global _active_path_task
+
     channel = f"robot:{ROBOT_NAME}:command"
+    # Remember the last single-waypoint target so RESUME can re-send it.
     last_travel_target: dict | None = None
 
-    async def publish_travel(alias: str, x: float, y: float):
-        nav_data = json.dumps({
-            "alias": alias,
-            "x": x,
-            "y": y,
-        })
-        ros_payload = {
-            "op": "publish",
-            "topic": "/travel_command",
-            "msg": {"data": nav_data},
-        }
-        ros_payload_str = json.dumps(ros_payload)
-        log.info(f"Sending to ROS2: {ros_payload_str}")
-        await ws.send(ros_payload_str)
+    r = await get_redis_client()
+    pubsub = r.pubsub()
+    try:
+        await pubsub.subscribe(channel)
+        log.info(f"Subscribed to Redis channel {channel}")
 
-    while True:
-        pubsub = None
+        async for message in pubsub.listen():
+            if message.get("type") != "message":
+                continue
+
+            raw_data = message.get("data")
+            if isinstance(raw_data, bytes):
+                raw_data = raw_data.decode("utf-8", errors="ignore")
+            if not isinstance(raw_data, str):
+                log.warning("Ignoring non-string command payload from Redis")
+                continue
+
+            try:
+                cmd = json.loads(raw_data)
+            except json.JSONDecodeError:
+                log.warning(f"Ignoring malformed JSON command payload: {raw_data!r}")
+                continue
+
+            if not isinstance(cmd, dict):
+                log.warning("Ignoring command payload that is not a JSON object")
+                continue
+
+            op = cmd.get("op")
+
+            # ── Single-waypoint travel ─────────────────────────────────────────
+            if op == "travel":
+                msg_payload = cmd.get("msg", {})
+                if not isinstance(msg_payload, dict):
+                    msg_payload = {}
+                target_alias = str(msg_payload.get("target_alias") or "")
+                target_x = _safe_float(msg_payload.get("target_x"), 0.0)
+                target_y = _safe_float(msg_payload.get("target_y"), 0.0)
+                last_travel_target = {"alias": target_alias, "x": target_x, "y": target_y}
+                await _publish_travel(ws, target_alias, target_x, target_y)
+                continue
+
+            # ── Multi-waypoint path execution (closed-loop) ───────────────────
+            if op == "execute_path":
+                waypoints: list[dict] = cmd.get("waypoints", [])
+                if not isinstance(waypoints, list) or not waypoints:
+                    log.warning("execute_path received with empty or invalid waypoints list")
+                    continue
+
+                # Cancel any in-flight path before starting a new one.
+                if _active_path_task and not _active_path_task.done():
+                    log.info("[Path] Cancelling previous path task before starting new one.")
+                    _active_path_task.cancel()
+                    try:
+                        await _active_path_task
+                    except asyncio.CancelledError:
+                        pass
+
+                # Remember final destination for RESUME support.
+                last_wp = waypoints[-1]
+                last_travel_target = {
+                    "alias": str(last_wp.get("alias") or ""),
+                    "x": _safe_float(last_wp.get("x"), 0.0),
+                    "y": _safe_float(last_wp.get("y"), 0.0),
+                }
+
+                # Run path execution in a background task so this loop remains
+                # responsive to incoming PAUSE / CANCEL commands.
+                _active_path_task = asyncio.create_task(
+                    _execute_path_waypoints(ws, waypoints),
+                    name="path_executor",
+                )
+                continue
+
+            # ── Control commands (PAUSE / RESUME / ESTOP / CANCEL) ────────────
+            if op == "control":
+                msg_payload = cmd.get("msg", {})
+                if not isinstance(msg_payload, dict):
+                    msg_payload = {}
+                action = str(msg_payload.get("command", cmd.get("command", ""))).upper().strip()
+                if not action:
+                    log.warning("Ignoring control payload without a command field")
+                    continue
+
+                if action in {"PAUSE", "ESTOP", "CANCEL"}:
+                    # Stop any running path task immediately.
+                    if _active_path_task and not _active_path_task.done():
+                        log.info(f"[{action}] Cancelling active path task.")
+                        _active_path_task.cancel()
+                        try:
+                            await _active_path_task
+                        except asyncio.CancelledError:
+                            pass
+                        _active_path_task = None
+
+                    # Freeze the robot at its current position.
+                    current = robot_state.get("mobileBaseState", {})
+                    stop_alias: str = str(current.get("qr_id") or action)
+                    stop_x: float = _safe_float(current.get("x", 0.0))
+                    stop_y: float = _safe_float(current.get("y", 0.0))
+                    await _publish_travel(ws, stop_alias, stop_x, stop_y)
+                    log.info(f"Applied {action}: froze robot at ({stop_x:.3f}, {stop_y:.3f})")
+                    continue
+
+                if action == "RESUME":
+                    if last_travel_target is None:
+                        log.warning("RESUME received but no prior travel target is available")
+                        continue
+                    await _publish_travel(
+                        ws,
+                        str(last_travel_target.get("alias", "")),
+                        _safe_float(last_travel_target.get("x", 0.0)),
+                        _safe_float(last_travel_target.get("y", 0.0)),
+                    )
+                    log.info("Applied RESUME: re-sent previous travel target")
+                    continue
+
+                log.warning(f"Ignoring unknown control command: {action!r}")
+                continue
+
+            log.warning(f"Ignoring unsupported command op: {op!r}")
+
+    finally:
         try:
-            r = await get_redis_client()
-            pubsub = r.pubsub()
-            await pubsub.subscribe(channel)
-            log.info(f"Subscribed to Redis channel {channel}")
-
-            async for message in pubsub.listen():
-                if message.get("type") != "message":
-                    continue
-
-                raw_data = message.get("data")
-                if isinstance(raw_data, bytes):
-                    raw_data = raw_data.decode("utf-8", errors="ignore")
-                if not isinstance(raw_data, str):
-                    log.warning("Ignoring non-string command payload from Redis")
-                    continue
-
-                try:
-                    cmd = json.loads(raw_data)
-                except json.JSONDecodeError:
-                    log.warning(f"Ignoring malformed JSON command payload: {raw_data!r}")
-                    continue
-
-                if not isinstance(cmd, dict):
-                    log.warning("Ignoring command payload that is not a JSON object")
-                    continue
-
-                op = cmd.get("op")
-                if op == "travel":
-                    msg_payload = cmd.get("msg", {})
-                    if not isinstance(msg_payload, dict):
-                        msg_payload = {}
-                    target_alias = str(msg_payload.get("target_alias") or "")
-                    target_x = _safe_float(msg_payload.get("target_x"), 0.0)
-                    target_y = _safe_float(msg_payload.get("target_y"), 0.0)
-                    last_travel_target = {"alias": target_alias, "x": target_x, "y": target_y}
-                    await publish_travel(target_alias, target_x, target_y)
-                    continue
-
-                if op == "control":
-                    msg_payload = cmd.get("msg", {})
-                    if not isinstance(msg_payload, dict):
-                        msg_payload = {}
-                    action = str(msg_payload.get("command", cmd.get("command", ""))).upper().strip()
-                    if not action:
-                        log.warning("Ignoring control payload without a command field")
-                        continue
-
-                    # The simulator only consumes /travel_command; to stop motion we publish
-                    # a "travel to current pose" command so it immediately snaps to IDLE.
-                    if action in {"PAUSE", "ESTOP", "CANCEL"}:
-                        current = robot_state.get("mobileBaseState", {})
-                        stop_alias = current.get("qr_id") or action
-                        stop_x = _safe_float(current.get("x", 0.0))
-                        stop_y = _safe_float(current.get("y", 0.0))
-                        await publish_travel(str(stop_alias), stop_x, stop_y)
-                        log.info(f"Applied control command {action} by freezing at ({stop_x}, {stop_y})")
-                        continue
-
-                    if action == "RESUME":
-                        if last_travel_target is None:
-                            log.warning("RESUME received but no prior travel target is available")
-                            continue
-                        await publish_travel(
-                            str(last_travel_target.get("alias", "")),
-                            _safe_float(last_travel_target.get("x", 0.0)),
-                            _safe_float(last_travel_target.get("y", 0.0)),
-                        )
-                        log.info("Applied RESUME by re-sending previous travel target")
-                        continue
-
-                    log.warning(f"Ignoring unknown control command: {action}")
-                    continue
-
-                log.warning(f"Ignoring unsupported command op: {op!r}")
-        except Exception as exc:
-            log.error(f"Command relay Redis error: {exc}. Reconnecting in {REDIS_RETRY_DELAY}s...")
-            await get_redis_client(force_reconnect=True)
-            await asyncio.sleep(REDIS_RETRY_DELAY)
-        finally:
-            if pubsub is not None:
-                try:
-                    await pubsub.unsubscribe(channel)
-                except Exception:
-                    pass
-                try:
-                    await pubsub.aclose()
-                except Exception:
-                    pass
+            await pubsub.unsubscribe(channel)
+        except Exception:
+            pass
+        try:
+            await pubsub.aclose()
+        except Exception:
+            pass
 
 
 async def subscribe_to_rosbridge():

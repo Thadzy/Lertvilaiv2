@@ -214,6 +214,11 @@ services:
       REDIS_PORT: 6379
       ROBOTS_CONFIG: ${ROBOTS_CONFIG:-{}}
       GRAPHQL_IDE: ${GRAPHQL_IDE:-graphiql}
+      # PostgREST connection for route_oracle A* path expansion
+      POSTGREST_URL: http://rest:3000
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      VRP_SERVER_URL: http://vrp_server:18080
+      GRAPH_ID: ${GRAPH_ID}
     depends_on:
       redis:
         condition: service_healthy
@@ -229,9 +234,9 @@ services:
   robot_bridge:
     build: ./robot_bridge
     environment:
-      ROBOT_NAME: SIMBOT
-      ROBOT_HOST: robot_simulator
-      ROBOT_PORT: "9090"
+      ROBOT_NAME: ${ROBOT_NAME:-FACOBOT}
+      ROBOT_HOST: ${ROBOT_HOST:-10.61.6.87}
+      ROBOT_PORT: ${ROBOT_PORT:-9090}
       REDIS_HOST: redis
       REDIS_PORT: "6379"
       HEARTBEAT_TTL: "10"

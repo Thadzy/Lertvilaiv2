@@ -264,7 +264,11 @@ export const useGraphData = (graphId: number) => {
         .select('id, type')
         .eq('graph_id', graphId);
 
+      // Build a map of DB id → DB type for type-change detection
+      const dbTypeMap = new Map<number, string>();
       if (currentDbNodes) {
+        currentDbNodes.forEach(n => dbTypeMap.set(n.id, n.type));
+
         const activeDbIds = new Set(existingNodes.map(n => n.dbId));
         // Also include cell IDs we skipped above
         activeNodes.forEach(n => {
@@ -280,13 +284,35 @@ export const useGraphData = (graphId: number) => {
         }
       }
 
+      // Detect type-changed nodes: remove from existingNodes, treat as delete+recreate
+      const typeChangedNodes: Node[] = [];
+      const stableExistingNodes = existingNodes.filter(({ flowNode, dbId }) => {
+        const dbType = dbTypeMap.get(dbId);
+        const canvasType = flowNode.data?.type as string;
+        if (dbType && dbType !== 'depot' && dbType !== 'cell' && canvasType && canvasType !== dbType) {
+          console.log(`[saveGraph] Type change detected: node ${dbId} ${dbType} → ${canvasType}`);
+          nodesToDelete.push(dbId);
+          typeChangedNodes.push(flowNode);
+          return false;
+        }
+        return true;
+      });
+      // Reassign existingNodes to only stable ones
+      existingNodes.length = 0;
+      stableExistingNodes.forEach(n => existingNodes.push(n));
+      // Add type-changed nodes to newNodes so they get recreated
+      newNodes.push(...typeChangedNodes);
+
+      console.log('[saveGraph] newNodes:', newNodes.length, '| existingNodes:', existingNodes.length);
+
       // -----------------------------------------------
       // B. Delete removed nodes
       // -----------------------------------------------
+      console.log('[saveGraph] B. nodesToDelete:', nodesToDelete);
       for (const nodeId of nodesToDelete) {
         const { error } = await supabase.rpc('wh_delete_node', { p_node_id: nodeId });
         if (error) {
-          console.warn(`[useGraphData] Failed to delete node ${nodeId}:`, error.message);
+          console.error(`[saveGraph] B. Failed to delete node ${nodeId}:`, error.message);
         }
       }
 
@@ -313,6 +339,7 @@ export const useGraphData = (graphId: number) => {
       // -----------------------------------------------
       // D. Create new nodes via RPC
       // -----------------------------------------------
+      console.log('[saveGraph] D. Creating', newNodes.length, 'new nodes...');
       for (const flowNode of newNodes) {
         const nodeType = (flowNode.data.type || 'waypoint') as string;
         const x = flowNode.position.x / SCALE_FACTOR;
@@ -370,23 +397,26 @@ export const useGraphData = (graphId: number) => {
 
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
-          console.error(`[useGraphData] Failed to create node '${alias}':`, msg);
+          console.error(`[saveGraph] D. Failed to create node '${alias}':`, msg);
         }
       }
 
       // -----------------------------------------------
-      // E. Sync Edges: Delete all, then recreate
+      // E. Sync Edges: Delete non-cell edges, then recreate
       // -----------------------------------------------
       const { data: currentEdges } = await supabase
         .from('wh_edges_view')
-        .select('edge_id, node_a_id, node_b_id')
+        .select('edge_id, node_a_id, node_b_id, node_a_type, node_b_type')
         .eq('graph_id', graphId);
 
+      console.log('[saveGraph] E. currentEdges in DB:', currentEdges?.length ?? 0, '| edges in canvas:', edges.length);
       if (currentEdges) {
         for (const edge of currentEdges) {
+          // Skip shelf→cell edges — they are auto-managed by wh_create_cell and must not be deleted
+          if (edge.node_a_type === 'cell' || edge.node_b_type === 'cell') continue;
           const { error } = await supabase.rpc('wh_delete_edge', { p_edge_id: edge.edge_id });
-          if (error && !error.message.includes('cell')) {
-            console.warn(`[useGraphData] Edge deletion skipped:`, error.message);
+          if (error) {
+            console.error(`[saveGraph] E. Edge delete failed:`, error.message);
           }
         }
       }
@@ -408,7 +438,7 @@ export const useGraphData = (graphId: number) => {
 
         if (error) {
           if (!error.message.includes('cell') && !error.message.includes('already exists')) {
-            console.warn(`[useGraphData] Failed to create edge:`, error.message);
+            console.error(`[saveGraph] E. Failed to create edge ${sourceId}->${targetId}:`, error.message);
           }
         }
       }
